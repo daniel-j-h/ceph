@@ -1758,6 +1758,9 @@ void CInode::finish_scatter_gather_update(int type)
   switch (type) {
   case CEPH_LOCK_IFILE:
     {
+      fragtree_t tmpdft = dirfragtree;
+      struct frag_info_t dirstat;
+
       // adjust summation
       assert(is_auth());
       inode_t *pi = get_projected_inode();
@@ -1796,7 +1799,7 @@ void CInode::finish_scatter_gather_update(int type)
 	  if (pf->fragstat.nsubdirs < 0)
 	    pf->fragstat.nsubdirs = 0;
 
-	  assert(!"bad/negative frag size" == g_conf->mds_verify_scatter);
+	  assert(!"bad/negative fragstat" == g_conf->mds_verify_scatter);
 	}
 
 	if (update) {
@@ -1805,28 +1808,38 @@ void CInode::finish_scatter_gather_update(int type)
 	  dout(10) << fg << " updated accounted_fragstat " << pf->fragstat << " on " << *dir << dendl;
 	}
 
-	if (fg == frag_t()) { // i.e., we are the only frag
-	  if (pi->dirstat.size() != pf->fragstat.size()) {
-	    clog.error() << "unmatched fragstat size on single "
-	       << "dirfrag " << dir->dirfrag() << ", inode has " 
-	       << pi->dirstat << ", dirfrag has " << pf->fragstat << "\n";
-	    
-	    // trust the dirfrag for now
-	    version_t v = pi->dirstat.version;
-	    pi->dirstat = pf->fragstat;
-	    pi->dirstat.version = v;
-
-	    assert(!"unmatched fragstat size" == g_conf->mds_verify_scatter);
-	  }
-	}
+	tmpdft.force_to_leaf(g_ceph_context, fg);
+	dirstat.add(pf->fragstat);
       }
       if (touched_mtime)
 	pi->mtime = pi->ctime = pi->dirstat.mtime;
       dout(20) << " final dirstat " << pi->dirstat << dendl;
 
+      if (dirstat.nfiles != pi->dirstat.nfiles ||
+	  dirstat.nsubdirs != pi->dirstat.nsubdirs) {
+	bool all = true;
+	list<frag_t> ls;
+	tmpdft.get_leaves_under(frag_t(), ls);
+	for (list<frag_t>::iterator p = ls.begin(); p != ls.end(); ++p)
+	  if (!dirfrags.count(*p)) {
+	    all = false;
+	    break;
+	  }
+	if (all) {
+	  clog.error() << "unmatched fragstat on " << ino() << ", inode has "
+		       << pi->dirstat << ", dirfrags have " << dirstat << "\n";
+	  // trust the dirfrags for now
+	  version_t v = pi->dirstat.version;
+	  pi->dirstat = dirstat;
+	  pi->dirstat.version = v;
+
+	  assert(!"unmatched fragstat" == g_conf->mds_verify_scatter);
+	}
+      }
+
       if (pi->dirstat.nfiles < 0 ||
 	  pi->dirstat.nsubdirs < 0) {
-	clog.error() << "bad/negative dir size on " << ino()
+	clog.error() << "bad/negative fragstat on " << ino()
 	    << ", inode has " << pi->dirstat << "\n";
 
 	if (pi->dirstat.nfiles < 0)
@@ -1834,13 +1847,17 @@ void CInode::finish_scatter_gather_update(int type)
 	if (pi->dirstat.nsubdirs < 0)
 	  pi->dirstat.nsubdirs = 0;
 
-	assert(!"bad/negative dir size" == g_conf->mds_verify_scatter);
+	assert(!"bad/negative fragstat" == g_conf->mds_verify_scatter);
       }
     }
     break;
 
   case CEPH_LOCK_INEST:
     {
+      fragtree_t tmpdft = dirfragtree;
+      nest_info_t rstat;
+      rstat.rsubdirs = 1;
+
       // adjust summation
       assert(is_auth());
       inode_t *pi = get_projected_inode();
@@ -1885,40 +1902,52 @@ void CInode::finish_scatter_gather_update(int type)
 	  pf->accounted_rstat = pf->rstat;
 	  dir->dirty_old_rstat.clear();
 	  pf->rstat.version = pf->accounted_rstat.version = pi->rstat.version;
+	  dir->check_rstats();
 	  dout(10) << fg << " updated accounted_rstat " << pf->rstat << " on " << *dir << dendl;
 	}
 
-	if (fg == frag_t()) { // i.e., we are the only frag
-	  if (pi->rstat.rbytes != pf->rstat.rbytes) { 
-	    clog.error() << "unmatched rstat rbytes on single dirfrag "
-		<< dir->dirfrag() << ", inode has " << pi->rstat
-		<< ", dirfrag has " << pf->rstat << "\n";
-	    
-	    // trust the dirfrag for now
-	    version_t v = pi->rstat.version;
-	    pi->rstat = pf->rstat;
-	    pi->rstat.version = v;
-	    
-	    assert(!"unmatched rstat rbytes" == g_conf->mds_verify_scatter);
-	  }
-	}
-	if (update)
-	  dir->check_rstats();
+	tmpdft.force_to_leaf(g_ceph_context, fg);
+	rstat.add(pf->rstat);
       }
       dout(20) << " final rstat " << pi->rstat << dendl;
 
-      //assert(pi->rstat.rfiles >= 0);
-      if (pi->rstat.rfiles < 0) {
-	clog.error() << "rfiles underflow " << pi->rstat.rfiles
-		     << " on " << *this << "\n";
-	pi->rstat.rfiles = 0;
+      if (rstat.rfiles != pi->rstat.rfiles ||
+	  rstat.rsubdirs != pi->rstat.rsubdirs ||
+	  rstat.rbytes != pi->rstat.rbytes) {
+	bool all = true;
+	list<frag_t> ls;
+	tmpdft.get_leaves_under(frag_t(), ls);
+	for (list<frag_t>::iterator p = ls.begin(); p != ls.end(); ++p)
+	  if (!dirfrags.count(*p)) {
+	    all = false;
+	    break;
+	  }
+	if (all) {
+	  clog.error() << "unmatched rstat on " << ino() << ", inode has "
+		       << pi->rstat << ", dirfrags have " << rstat << "\n";
+	  // trust the dirfrag for now
+	  version_t v = pi->rstat.version;
+	  pi->rstat = rstat;
+	  pi->rstat.version = v;
+
+	  assert(!"unmatched rstat" == g_conf->mds_verify_scatter);
+	}
       }
 
-      //assert(pi->rstat.rsubdirs >= 0);
-      if (pi->rstat.rsubdirs < 0) {
-	clog.error() << "rsubdirs underflow " << pi->rstat.rsubdirs
-		     << " on " << *this << "\n";
-	pi->rstat.rsubdirs = 0;
+      if (pi->rstat.rsubdirs < 0 ||
+	  pi->rstat.rfiles < 0 ||
+	  pi->rstat.rbytes < 0) {
+	clog.error() << "bad/negative rstat on " << ino()
+		     << ", inode has " << pi->rstat << "\n";
+
+	if (pi->rstat.rsubdirs < 0)
+	  pi->rstat.rsubdirs = 0;
+	if (pi->rstat.rfiles < 0)
+	  pi->rstat.rfiles = 0;
+	if (pi->rstat.rbytes < 0)
+	  pi->rstat.rbytes = 0;
+
+	assert(!"bad/negative rstat" == g_conf->mds_verify_scatter);
       }
     }
     break;
