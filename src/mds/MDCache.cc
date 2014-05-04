@@ -1090,6 +1090,38 @@ void MDCache::adjust_bounded_subtree_auth(CDir *dir, vector<dirfrag_t>& bound_df
 
   set<CDir*> bounds;
   get_force_dirfrag_bound_set(bound_dfs, bounds);
+
+  // Be careful if dir is other MDS's mdsdir. It is possible some bounds we have
+  // are not under the mdsdir (MDS crashed after journaling rmdir, but before
+  // sending MDentryUnlink to us).
+  if (MDS_INO_MDSDIR(auth.first) == dir->ino() &&
+      (mds->is_clientreplay() || mds->is_active() || mds->is_stopping())) {
+    assert(auth.first != mds->get_nodeid());
+    map<int, MCacheExpire*> expiremap;
+    for (set<CDir*>::iterator p = bounds.begin(); p != bounds.end(); ) {
+      CDir *dir = *p;
+      ++p;
+      assert(dir->is_subtree_root());
+      if (!dir->get_parent_dir()->get_inode()->is_stray()) {
+	// try trimming the difrag
+	assert(!dir->is_auth());
+	while (dir->begin() != dir->end()) {
+	  CDentry *dn = dir->begin()->second;
+	  assert(dn->get_linkage()->is_null());
+	  if (dn->get_num_ref() > 0)
+	    break;
+	  trim_dentry(dn, expiremap);
+	}
+	if (dir->get_num_ref() == 1) { // subtree pin
+	  trim_dirfrag(dir, 0, expiremap);
+	  bounds.erase(dir);
+	}
+      }
+    }
+    if (!expiremap.empty())
+      send_expire_messages(expiremap);
+  }
+
   adjust_bounded_subtree_auth(dir, bounds, auth);
 }
 
